@@ -17,6 +17,7 @@
 /* OPV-RTP configuration */
 #define SYMBOLS_PER_40MS	1092
 #define SAMPLES_PER_SYMBOL	10
+#define SAMPLES_PER_40MS	(SYMBOLS_PER_40MS * SAMPLES_PER_SYMBOL)
 #define SAMPLES_PER_SECOND	273000
 
 /* helper macros */
@@ -157,7 +158,7 @@ static bool get_lo_chan(enum iodev d, struct iio_channel **chn)
 	}
 }
 
-/* finds AD9361 decimation/interpolation configuration channels, I hope */
+/* finds AD9361 decimation/interpolation configuration channels */
 static bool get_dec8_int8_chan(enum iodev d, struct iio_channel **chn)
 {
 	struct iio_device *dev;
@@ -171,62 +172,113 @@ static bool get_dec8_int8_chan(enum iodev d, struct iio_channel **chn)
 	}
 }
 
+/* enables or disables Pluto's FPGA 8x interpolator for tx */
+static bool set_pluto_8x_interpolator(bool enable)
+{
+	// The interpolator is set by channel-specific attributes
+	// 		of the channel named voltage0
+	// 		of the device named cf-ad9361-dds-core-lpc.
+	// Two attributes are involved: sampling_frequency and sampling_frequency_available.
+	// The attribute sampling_frequency_available returns a list of two available values,
+	// which should differ by a factor of 8 (within a few counts).
+	// The higher value is the sample clock rate when interpolation is not used;
+	// the lower value is the effective sample clock rate when interpolation is used.
+	// Set the attribute sampling_frequency to the value corresponding to the range of
+	// sample rates you want to use.
+
+	struct iio_channel *tx_int8_chn;
+	long long sf1, sf2;
+
+	printf("* %s 8x transmit interpolation\n", enable ? "Enabling" : "Disabling");
+
+	// obtain the transmit interpolator's config channel,
+	// namely device cf-ad9361-dds-core-lpc, channel voltage0
+	if (!get_dec8_int8_chan(TX, &tx_int8_chn)) { return false; }
+	
+	// read the attribute sampling_frequency_available,
+	// which should be a list of two, like '30720000 3840000 '
+	if(iio_channel_attr_read(	tx_int8_chn,
+								"sampling_frequency_available",
+								tmpstr, sizeof(tmpstr)
+							) <= 0) {
+		fprintf(stderr, "No sampling_frequency_available attribute\n");
+		return false;
+		}
+
+	// parse the returned pair of numbers
+	if (2 != sscanf(tmpstr, "%lld %lld ", &sf1, &sf2)) {
+		fprintf(stderr, "sampling_frequency_available format unexpected\n");
+		return false;
+	}
+
+	// validate that they're in approximate 8x ratio
+	if (abs(8 * sf2 - sf1) > 20) {
+		fprintf(stderr, "sampling_frequency_available values not in ~8x ratio\n");
+		return false;
+	}
+
+	// Now we can enable or disable interpolation
+	if (enable) {
+		// write the lower of the two values into attribute sampling_frequency
+		// to set the interpolator to active.
+		printf("* Writing %lld to set 8x interpolation\n", sf2);
+		wr_ch_lli(tx_int8_chn, "sampling_frequency", sf2);
+	} else {
+		// write the higher of the two values into attribute sampling_frequency
+		// to set the interpolator to inactive.
+		printf("* Writing %lld to disable 8x interpolation\n", sf1);
+		wr_ch_lli(tx_int8_chn, "sampling_frequency", sf1);
+	}
+
+	return true;
+}
+
+/* sets TX sample rate, using Pluto's FPGA 8x interpolator if needed */
+static bool set_tx_sample_rate(struct iio_channel *phy_chn, long long sample_rate)
+{
+	long long ad9361_sample_rate;
+	bool use_pluto_8x_interpolator;
+
+	if (sample_rate < 260417) {
+		fprintf(stderr, "Pluto can't sample slower than 260417 Hz\n");
+		shutdown();
+	} else if (sample_rate > 61440000) {
+		fprintf(stderr, "Pluto can't sample faster than 61.44 MHz\n");
+		shutdown();
+	} else if (sample_rate < 2083333) {
+		ad9361_sample_rate = sample_rate *8;
+		use_pluto_8x_interpolator = 1;
+	} else {
+		ad9361_sample_rate = sample_rate;
+		use_pluto_8x_interpolator = 0;
+	}
+
+	if (!set_pluto_8x_interpolator(use_pluto_8x_interpolator)) {
+		fprintf(stderr, "Failed to set Pluto 8x interpolator\n");
+		shutdown();
+	}
+
+	// Now we can set the actual sample rate within the range
+	// supported by this transmit interpolation mode.
+	printf("* Setting AD9361 sample rate to %lld Hz\n", ad9361_sample_rate);
+	wr_ch_lli(phy_chn, "sampling_frequency", ad9361_sample_rate);
+
+	return true;
+}
+
 /* applies streaming configuration through IIO */
 bool cfg_ad9361_streaming_ch(struct stream_cfg *cfg, enum iodev type, int chid)
 {
 	struct iio_channel *chn = NULL;
 	struct iio_channel *chn2 = NULL;
-	struct iio_channel *chn3 = NULL;
-	long long sf1, sf2;
-	size_t response_buf_len = 40;
-	char response_buf[response_buf_len];
 
 	// Configure phy and lo channels
 	printf("* Acquiring AD9361 phy channel %d\n", chid);
 	if (!get_phy_chan(type, chid, &chn)) {	return false; }
 	wr_ch_str(chn, "rf_port_select",     cfg->rfport);
 	wr_ch_lli(chn, "rf_bandwidth",       cfg->bw_hz);
-	if (cfg->fs_hz >= 2083334) {		// Pluto minimum without extra interpolation
-		IIO_ENSURE(0 && "high sample rates not implemented");
-	} else if (cfg->fs_hz < 260417) {	// Pluto minimum with 8x interpolation
-		IIO_ENSURE(0 && "Pluto can't sample that low, even with 8x interpolation");
-	} else {
-		// Enable the AD9361's TX FIR 8x interpolator
-		// The interpolator is set by channel-specific attributes
-		// of the channel named voltage0
-		// of the device named cf-ad9361-dds-core-lpc.
-		// Two attributes are involved: sampling_frequency and sampling_frequency_available.
-		// The attribute sampling_frequency_available returns a list of two available values,
-		// which should differ by a factor of 8. The higher value is the sample clock rate
-		// when interpolation is not used; the lower value is the effective sample clock rate
-		// when interpolation is used.
-		// Set the attribute sampling_frequency to the value corresponding to the range of
-		// sample rates you want to use.
+	if (!set_tx_sample_rate(chn, cfg->fs_hz)) { return false; }
 
-		printf("* Setting 8x transmit interpolation\n");
-
-		// obtain the transmit interpolator's config channel,
-		// namely device cf-ad9361-dds-core-lpc, channel voltage0
-		if (!get_dec8_int8_chan(TX, &chn3)) { return false; }
-		
-		// read the attribute sampling_frequency_available,
-		// which should be a list of two, like '30720000 3840000 '
-		IIO_ENSURE(iio_channel_attr_read(chn3,
-			"sampling_frequency_available",
-			response_buf, response_buf_len) > 0 && "No sampling_frequency_available attribute");
-		IIO_ENSURE(2 == sscanf(response_buf, "%lld %lld ", &sf1, &sf2) && "sampling_frequency_available format unexpected");
-		IIO_ENSURE(abs(8 * sf2 - sf1) < 20 && "sampling_frequency_available values not in 8x ratio");
-
-		// now write the lower of the two values into attribute sampling_frequency
-		// to set the interpolator to active.
-		printf("* Writing %lld to set 8x interpolation\n", sf2);
-		wr_ch_lli(chn3, "sampling_frequency", sf2);
-
-		// Now we can set the actual sample rate within the range
-		// supported by this transmit interpolation mode.
-		printf("* Setting AD9361 sample rate to %lld Hz\n", cfg->fs_hz * 8);
-		wr_ch_lli(chn, "sampling_frequency", cfg->fs_hz * 8);
-	}
 	// Configure LO channel
 	printf("* Acquiring AD9361 %s lo channel\n", type == TX ? "TX" : "RX");
 	if (!get_lo_chan(type, &chn2)) { return false; }
@@ -292,11 +344,8 @@ int main (int argc, char **argv)
 //	rxcfg.rfport = "A_BALANCED"; // port A (select for rf freq.)
 
 	// TX stream config
-//	txcfg.bw_hz = MHZ(1.5); // 1.5 MHz rf bandwidth
 	txcfg.bw_hz = 200000;	// 200 kHz RF bandwidth, Pluto's minimum
-//	txcfg.fs_hz = MHZ(2.5);	// 2.5 MS/s tx sample rate
 	txcfg.fs_hz = SAMPLES_PER_SECOND;	// baseband sample rate
-//	txcfg.lo_hz = GHZ(2.5); // 2.5 GHz rf frequency
 	txcfg.lo_hz = MHZ(905.05);	// 905.05 MHz RF frequency
 	txcfg.rfport = "A"; // port A (select for rf freq.)
 
@@ -310,14 +359,14 @@ int main (int argc, char **argv)
 	IIO_ENSURE(iio_context_get_devices_count(ctx) > 0 && "No devices");
 	unsigned int attrs_count = iio_context_get_attrs_count(ctx);
 	IIO_ENSURE(attrs_count > 0 && "No context attributes");
-	printf("Found IIO context:\n");
-	for (unsigned int index=0; index < attrs_count; index++) {
-		const char *attr_name;
-		const char *attr_val;
-		if (iio_context_get_attr(ctx, index, &attr_name, &attr_val) == 0) {
-			printf("%s: %s\n", attr_name, attr_val);
-		}
-	}
+	// printf("Found IIO context:\n");
+	// for (unsigned int index=0; index < attrs_count; index++) {
+	// 	const char *attr_name;
+	// 	const char *attr_val;
+	// 	if (iio_context_get_attr(ctx, index, &attr_name, &attr_val) == 0) {
+	// 		printf("%s: %s\n", attr_name, attr_val);
+	// 	}
+	// }
 
 	printf("* Acquiring AD9361 streaming devices\n");
 	IIO_ENSURE(get_ad9361_stream_dev(TX, &tx) && "No tx dev found");
@@ -346,13 +395,13 @@ int main (int argc, char **argv)
 	
 //	cfg_ad9361_txlo_powerdown(1);	// !!! try to suppress noise burst
 
-	printf("* Creating non-cyclic IIO buffers of %d symbols (1 40ms frame)\n", SYMBOLS_PER_40MS);
+	printf("* Creating non-cyclic IIO buffers of %d samples (1 40ms frame)\n", SAMPLES_PER_40MS);
 //	rxbuf = iio_device_create_buffer(rx, 1024*1024, false);
 //	if (!rxbuf) {
 //		perror("Could not create RX buffer");
 //		shutdown();
 //	}
-	txbuf = iio_device_create_buffer(tx, SYMBOLS_PER_40MS, false);
+	txbuf = iio_device_create_buffer(tx, SAMPLES_PER_40MS, false);
 	if (!txbuf) {
 		perror("Could not create TX buffer");
 		shutdown();
@@ -405,7 +454,7 @@ int main (int argc, char **argv)
 		}
 
 		// Sample counter increment and status output
-		nrx += 0; // nbytes_rx / iio_device_get_sample_size(rx);
+		// nrx += nbytes_rx / iio_device_get_sample_size(rx);
 		ntx += nbytes_tx / iio_device_get_sample_size(tx);
 		printf("\tRX %8.2f MSmp, TX %8.2f MSmp\n", nrx/1e6, ntx/1e6);
 		
