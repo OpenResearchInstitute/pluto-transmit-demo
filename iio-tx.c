@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * libiio - AD9361 IIO streaming example
+ * based on libiio - AD9361 IIO streaming example
  *
  * Copyright (C) 2014 IABG mbH
  * Author: Michael Feilen <feilen_at_iabg.de>
@@ -20,6 +20,9 @@
 #define SAMPLES_PER_40MS	(SYMBOLS_PER_40MS * SAMPLES_PER_SYMBOL)
 #define SAMPLES_PER_SECOND	273000
 
+/* Signal generator */
+extern void next_tx_sample(int16_t * const i_sample, int16_t * const q_sample);
+
 /* helper macros */
 #define MHZ(x) ((long long)(x*1000000.0 + .5))
 #define GHZ(x) ((long long)(x*1000000000.0 + .5))
@@ -36,7 +39,7 @@ enum iodev { RX, TX };
 
 /* common RX and TX streaming params */
 struct stream_cfg {
-	long long bw_hz; // Analog banwidth in Hz
+	long long bw_hz; // Analog bandwidth in Hz
 	long long fs_hz; // Baseband sample rate in Hz
 	long long lo_hz; // Local oscillator frequency in Hz
 	const char* rfport; // Port name
@@ -159,6 +162,7 @@ static bool get_lo_chan(enum iodev d, struct iio_channel **chn)
 }
 
 /* finds AD9361 decimation/interpolation configuration channels */
+// !!! not tested for receive decimation
 static bool get_dec8_int8_chan(enum iodev d, struct iio_channel **chn)
 {
 	struct iio_device *dev;
@@ -166,16 +170,24 @@ static bool get_dec8_int8_chan(enum iodev d, struct iio_channel **chn)
 	IIO_ENSURE(get_ad9361_stream_dev(d, &dev) && "No dec/int dev found");
 
 	switch (d) {
-	case RX: *chn = iio_device_find_channel(dev, get_ch_name("voltage", 0), false); return *chn != NULL;
-	case TX: *chn = iio_device_find_channel(dev, get_ch_name("voltage", 0), true); return *chn != NULL;
-	default: IIO_ENSURE(0); return false;
+		case RX:
+			*chn = iio_device_find_channel(dev, get_ch_name("voltage", 0), false);
+			return *chn != NULL;
+
+		case TX:
+			*chn = iio_device_find_channel(dev, get_ch_name("voltage", 0), true);
+			return *chn != NULL;
+
+		default:
+			IIO_ENSURE(0);
+			return false;
 	}
 }
 
 /* enables or disables Pluto's FPGA 8x interpolator for tx */
 static bool set_pluto_8x_interpolator(bool enable)
 {
-	// The interpolator is set by channel-specific attributes
+	// The tx interpolator is set by channel-specific attributes
 	// 		of the channel named voltage0
 	// 		of the device named cf-ad9361-dds-core-lpc.
 	// Two attributes are involved: sampling_frequency and sampling_frequency_available.
@@ -258,8 +270,8 @@ static bool set_tx_sample_rate(struct iio_channel *phy_chn, long long sample_rat
 		shutdown();
 	}
 
-	// Now we can set the actual sample rate within the range
-	// supported by this transmit interpolation mode.
+	// Now we can set the sample rate at the AD9361, which is either
+	// the actual sample rate or the sample rate after interpolation.
 	printf("* Setting AD9361 sample rate to %lld Hz\n", ad9361_sample_rate);
 	wr_ch_lli(phy_chn, "sampling_frequency", ad9361_sample_rate);
 
@@ -277,7 +289,9 @@ bool cfg_ad9361_streaming_ch(struct stream_cfg *cfg, enum iodev type, int chid)
 	if (!get_phy_chan(type, chid, &chn)) {	return false; }
 	wr_ch_str(chn, "rf_port_select",     cfg->rfport);
 	wr_ch_lli(chn, "rf_bandwidth",       cfg->bw_hz);
-	if (!set_tx_sample_rate(chn, cfg->fs_hz)) { return false; }
+	if (type == TX) {
+		if (!set_tx_sample_rate(chn, cfg->fs_hz)) { return false; }
+	}
 
 	// Configure LO channel
 	printf("* Acquiring AD9361 %s lo channel\n", type == TX ? "TX" : "RX");
@@ -286,7 +300,10 @@ bool cfg_ad9361_streaming_ch(struct stream_cfg *cfg, enum iodev type, int chid)
 	return true;
 }
 
-/* turns off the transmit local oscillator */
+/* turns off the transmit local oscillator
+ *
+ * This eliminates L.O. leakage through the antenna.
+ */
 static bool cfg_ad9361_txlo_powerdown(long long val)
 {
 	struct iio_channel *chn = NULL;
@@ -449,8 +466,10 @@ int main (int argc, char **argv)
 			// Example: fill with zeros
 			// 12-bit sample needs to be MSB aligned so shift by 4
 			// https://wiki.analog.com/resources/eval/user-guides/ad-fmcomms2-ebz/software/basic_iq_datafiles#binary_format
-			((int16_t*)p_dat)[0] = 0 << 4; // Real (I)
-			((int16_t*)p_dat)[1] = 0 << 4; // Imag (Q)
+			//((int16_t*)p_dat)[0] = 0 << 4; // Real (I)
+			//((int16_t*)p_dat)[1] = 0 << 4; // Imag (Q)
+			next_tx_sample((int16_t*)p_dat, (int16_t*)(p_dat+2));
+//			printf("%d %d\n", ((int16_t*)p_dat)[0], ((int16_t*)p_dat)[1]);
 		}
 
 		// Sample counter increment and status output
