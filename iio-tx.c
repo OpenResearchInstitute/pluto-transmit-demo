@@ -15,10 +15,10 @@
 #include <unistd.h>
 
 /* OPV-RTP configuration */
-#define SYMBOLS_PER_40MS	1092
+#define SYMBOLS_PER_40MS	1084
 #define SAMPLES_PER_SYMBOL	10
 #define SAMPLES_PER_40MS	(SYMBOLS_PER_40MS * SAMPLES_PER_SYMBOL)
-#define SAMPLES_PER_SECOND	273000
+#define SAMPLES_PER_SECOND	271000
 
 /* Signal generator */
 extern void next_tx_sample(int16_t * const i_sample, int16_t * const q_sample);
